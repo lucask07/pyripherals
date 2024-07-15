@@ -121,29 +121,35 @@ class DDR3():
         return amplitude
 
     @staticmethod
-    def closest_frequency(freq):
+    def closest_frequency(freq, sample_size=None):
         """Determine closest frequency so the waveform evenly divides into the length of the DDR3
 
         Parameters
         ----------
         freq : float
             Desired frequency
-
+        sample_size : int 
+            length of the array to populate 
+            almost always use None so that sample_size = DDR3.SAMPLE_SIZE
+            
         Returns
         -------
         new_frequency : float 
             The closest possible frequency
         """
 
+        if sample_size is None:
+            sample_size = DDR3.SAMPLE_SIZE
+
         samples_per_period = (1/freq) / DDR3.UPDATE_PERIOD
 
         if samples_per_period <= 2:
             print('Frequency is too high for the DDR update rate')
             return None
-        total_periods = DDR3.SAMPLE_SIZE/samples_per_period
+        total_periods = sample_size/samples_per_period
         # round and recalculate frequency
         round_total_periods = np.round(total_periods)
-        round_samples_per_period = DDR3.SAMPLE_SIZE / \
+        round_samples_per_period = sample_size / \
             round_total_periods
         new_frequency = 1 / \
             (DDR3.UPDATE_PERIOD * round_samples_per_period)
@@ -193,6 +199,75 @@ class DDR3():
             return -1
         ddr_seq = ddr_seq.astype(np.uint16)
         return ddr_seq, frequency
+
+    @staticmethod
+    def make_chirp(amplitude, frequencies, periods,
+                       offset=0x2000, actual_frequency=True):
+        """Return a chirp multiple sine-wave frequencies array for writing to DDR.
+
+        The conversion from float or int voltage to int digital (binary) code
+        should take place BEFORE this function.
+
+        Parameters
+        ----------
+        amplitude : int
+            Digital (binary) value of the sine wave.
+        frequencies : np.array (floats)
+            Desired frequencies in Hz.
+        periods : int or np.array (of ints)
+            Number of periods for all frequencies. or one for each
+        offset : int
+            Digital (binary) value offset.
+        actual_frequency : bool
+            Decide whether closest frequency that fits an integer number of periods is used.
+
+        Returns
+        -------
+        ddr_seq : numpy.ndarray 
+            to be assigned to DDR data array  
+
+        frequencies : np.array (floats)
+            actual frequencies after closest_frequency
+        """
+        ddr_seq = np.zeros(DDR3.SAMPLE_SIZE)
+
+        if (amplitude) > offset:
+            print('Error: amplitude in sine-wave is too large')
+            return -1
+        
+        if type(periods) == int:
+            periods = [periods]*len(frequencies)
+        if len(periods) != len(frequencies):
+            print('Error length of periods must match frequencies')
+
+        idx_left = 0
+        frequency_out = []
+        indices = []
+
+        for frequency, period in zip(frequencies, periods):
+            if frequency != frequencies[-1]:
+                chirp_length = int(period*(1/frequency)/DDR3.UPDATE_PERIOD)
+            else:
+                chirp_length = DDR3.SAMPLE_SIZE - idx_left
+
+            if actual_frequency:
+                frequency = DDR3.closest_frequency(frequency, chirp_length)
+            
+
+            t = np.arange(0, DDR3.UPDATE_PERIOD*chirp_length,
+                        DDR3.UPDATE_PERIOD)
+            # print('length of time axis after creation ', len(t))
+            ddr_seq_tmp = (amplitude)*np.sin(t*frequency*2*np.pi) + offset
+            if any(ddr_seq_tmp < 0) or any(ddr_seq_tmp > (2**16-1)):
+                print('Error: Uint16 overflow in make sine wave')
+                return -1
+            ddr_seq[idx_left:(idx_left + len(t))] = ddr_seq_tmp.astype(np.uint16)
+            frequency_out.append(frequency)
+            indices.append((idx_left, idx_left + len(t)))
+
+            idx_left = idx_left + len(t)
+        return ddr_seq, frequency_out, indices
+
 
     @staticmethod
     def make_ramp(start, stop, step, actual_length=True):
@@ -694,13 +769,15 @@ class DDR3():
             dac_data[2] = chan_data[5][0::2]
             dac_data[3] = chan_data[5][1::2]
             # dac channels 4,5 are available but not every sample. skip for now. TODO: add channels 4,5
-
+            dac_data[4] = chan_data[6][2::5] # observer at 1 MSPS 
+            dac_data[5] = chan_data[6][3::5] # observer at 1 MSPS - shifted by 200 ns 
+            dac_data[6] = chan_data[6][4::5] # observer sampled at 1 MSPS - shifted by 200 ns twice 
             ads = {}
             ads['A'] = custom_signed_to_int(chan_data[7][0::5], 16)
             if bitfile_version < 2: # 00.00.02 -> 2
                 ads['B'] = custom_signed_to_int(chan_data[7][1::5], 16)
             else:
-                ads['B'] = custom_signed_to_int(chan_data[6][0::5], 16)
+                ads['B'] = custom_signed_to_int(chan_data[6][0::5], 16) # cycle cnt 9 and 4
             error = False
             # check that the constant values are constant
             constant_values = {0: 0xaa55, 1: (0x28b<<5), 2: 0x77bb, 3: (0x28c<<5)}
@@ -762,12 +839,12 @@ class DDR3():
             DDR3.NUM_ADC_CHANNELS*2))  # readings per ADC
         repeat = 0
         adc_readings = chunk_size*num_repeats
-        print(f'Anticipated chunk size (readings per channel) {chunk_size}')
+        # print(f'Anticipated chunk size (readings per channel) {chunk_size}')
         print(
             f'Reading {adc_readings*2/1024} kB per ADC channel for a total of {adc_readings*DDR3.ADC_PERIOD*1000} ms of data')
 
         self.set_adc_read()  # enable data into the ADC reading FIFO
-        time.sleep(adc_readings*DDR3.ADC_PERIOD)
+        #time.sleep(adc_readings*DDR3.ADC_PERIOD)
 
         # Save ADC DDR data to a file
         with h5py.File(full_data_name, file_mode) as file:
@@ -834,7 +911,7 @@ class DDR3():
             sample_size=DDR3.BLOCK_SIZE * blk_multiples
         )
         d = np.frombuffer(t, dtype=np.uint8).astype(np.uint32)
-        print(f'Bytes read: {bytes_read_error}')
+        # print(f'Bytes read: {bytes_read_error}')
         return d, bytes_read_error
 
     def set_index(self, factor, factor2=None):
