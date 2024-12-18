@@ -177,10 +177,16 @@ class PIT:
         else: # count overflowed and need to use the prescaler 
             prescaler = int(np.ceil(np.log2(cnt/(PIT.COUNT_DEPTH))))
             cnt = int(cnt/2**prescaler)
+        if prescaler > 15:
+            print('ERROR - prescaler is too large. Period must be below 10.73 seconds')
 
+        self.stop()
+        print(f'Stopping PIT timer')
         print(f'Set period with prescaler {prescaler} and count {cnt}')
         self.wb_write('MOD', cnt)
         self.wb_write('PRE_SCALR', prescaler)
+        print(f'Starting PIT timer')
+        self.start()
 
     def stop(self):
         self.wb_write('CNT_EN', 0)
